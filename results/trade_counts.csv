@@ -1,0 +1,13 @@
+run,venue,symbol,trades,live,recovered
+baseline,binance,BTC-USDT,357312,357133,179
+baseline,binance,ETH-USDT,296307,296013,294
+baseline,coinbase,BTC-USD,168125,168054,71
+baseline,coinbase,ETH-USD,35248,35211,37
+baseline,kraken,BTC-USD,12510,12510,0
+baseline,kraken,ETH-USD,3832,3832,0
+chaos,binance,BTC-USDT,142110,19246,122864
+chaos,binance,ETH-USDT,135524,20007,115517
+chaos,coinbase,BTC-USD,79649,11213,68436
+chaos,coinbase,ETH-USD,15178,2249,12929
+chaos,kraken,BTC-USD,5677,768,4909
+chaos,kraken,ETH-USD,2264,387,1877

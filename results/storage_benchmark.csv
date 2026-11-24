@@ -1,0 +1,7 @@
+method,batch,rows,fresh_rows_per_s,replay_rows_per_s
+copy_dedup,100,100000,3976,7282
+executemany,100,100000,1480,1970
+copy_dedup,1000,100000,11646,16485
+executemany,1000,100000,3720,3890
+copy_dedup,10000,100000,11092,93594
+executemany,10000,100000,2990,3132

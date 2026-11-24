@@ -1,0 +1,30 @@
+# Analysis windows of the live experiment (UTC), from the experiment log.
+#
+# A window refers to a run (by label), may be narrowed with `start` / `end`, and may exclude
+# intervals. "noisy" is the planned noisy-neighbour phase: the test suite and a storage benchmark
+# ran in a loop on the same host, competing with the pipeline for CPU and for the database.
+# The quiet window also excludes 40 seconds during which a leftover script from an aborted
+# attempt ran one test pass (14:00:11-14:00:50). During the fault-injection run the host was
+# suspended from 15:23:53 to 15:48:51 (no log line, although reconnections are retried at
+# least every 30 s); that interval is excluded from the chaos window's latency statistics.
+
+[[window]]
+name = "baseline"
+run = "baseline"
+
+[[window]]
+name = "baseline_quiet"
+run = "baseline"
+end = "2026-11-24T14:33:04+00:00"
+exclude = [["2026-11-24T14:00:00+00:00", "2026-11-24T14:01:30+00:00"]]
+
+[[window]]
+name = "noisy"
+run = "baseline"
+start = "2026-11-24T14:33:04+00:00"
+end = "2026-11-24T14:48:56+00:00"
+
+[[window]]
+name = "chaos"
+run = "chaos"
+exclude = [["2026-11-24T15:23:45+00:00", "2026-11-24T15:49:15+00:00"]]

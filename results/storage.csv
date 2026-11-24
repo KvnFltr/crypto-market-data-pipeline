@@ -1,0 +1,3 @@
+table,rows,bytes_uncompressed,bytes_compressed
+trades,1318080,365289472,17973248
+quotes,115084,27582464,3063808
