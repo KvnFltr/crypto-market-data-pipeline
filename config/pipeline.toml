@@ -1,0 +1,38 @@
+# marketpipe configuration. The DSN can be overridden with the MARKETPIPE_DSN environment variable.
+
+[database]
+dsn = "postgresql://marketpipe:marketpipe@localhost:5432/marketpipe"
+
+[pipeline]
+queue_size = 100000          # events buffered between the feeds and the writer
+batch_size = 2000            # rows per database batch
+flush_interval_s = 0.1       # maximum time a row waits for its batch
+metrics_port = 8000          # Prometheus endpoint, 0 to disable
+resume = true                # recover the trades missed while the pipeline was down
+resume_max_age_s = 21600
+max_backfill_trades = 500000
+ping_interval_s = 10
+
+[clock]
+ntp_servers = ["time.cloudflare.com", "time.google.com"]
+interval_s = 60
+
+[[feeds]]
+venue = "binance"
+symbols = ["BTC-USDT", "ETH-USDT"]
+order_book = true
+
+[[feeds]]
+venue = "coinbase"
+symbols = ["BTC-USD", "ETH-USD"]
+
+[[feeds]]
+venue = "kraken"
+symbols = ["BTC-USD", "ETH-USD"]
+
+[chaos]                      # fault injection, also enabled by `marketpipe run --chaos`
+enabled = false
+mean_interval_s = 300
+min_downtime_s = 1
+max_downtime_s = 20
+seed = 7

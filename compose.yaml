@@ -1,0 +1,78 @@
+# TimescaleDB + Prometheus + Grafana, and optionally the pipeline itself.
+#
+#   docker compose up -d                       # storage and monitoring; run the pipeline on the host
+#   docker compose --profile pipeline up -d    # everything in containers
+#
+# Grafana: http://localhost:3000 (anonymous read access, admin/admin to edit)
+# Prometheus: http://localhost:9090
+
+name: marketpipe
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:2.31.2-pg17
+    environment:
+      POSTGRES_USER: marketpipe
+      POSTGRES_PASSWORD: marketpipe
+      POSTGRES_DB: marketpipe
+      TIMESCALEDB_TELEMETRY: "off"
+    ports:
+      - "5432:5432"
+    volumes:
+      - tsdata:/var/lib/postgresql/data
+      - ./src/marketpipe/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U marketpipe -d marketpipe"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+      - promdata:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.6
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/marketpipe.json
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - timescaledb
+    restart: unless-stopped
+
+  pipeline:
+    profiles: ["pipeline"]
+    build: .
+    command: ["run", "--config", "/app/config/pipeline.toml"]
+    environment:
+      MARKETPIPE_DSN: postgresql://marketpipe:marketpipe@timescaledb:5432/marketpipe
+    ports:
+      - "8000:8000"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  tsdata:
+  promdata:

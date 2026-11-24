@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marketpipe"
+version = "1.0.0"
+description = "Real-time crypto market data pipeline: websocket ingestion, gap detection and recovery, TimescaleDB storage, latency monitoring"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Kevin Feltrin" }]
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=13.1",
+    "httpx>=0.27",
+    "asyncpg>=0.29",
+    "orjson>=3.10",
+    "prometheus-client>=0.20",
+    "uvloop>=0.19; sys_platform != 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6", "mypy>=1.11"]
+analysis = ["numpy>=1.26", "pandas>=2.2", "matplotlib>=3.8"]
+
+[project.scripts]
+marketpipe = "marketpipe.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["integration: requires a running TimescaleDB (MARKETPIPE_TEST_DSN)"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+"analysis/*" = ["E501"]  # long SQL and LaTeX strings in one-off analysis scripts
+"tools/latency_probe.py" = ["ASYNC230"]  # one small CSV line per second: blocking I/O is negligible
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["asyncpg.*", "prometheus_client.*"]
+ignore_missing_imports = true
