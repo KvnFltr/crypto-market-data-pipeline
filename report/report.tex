@@ -1,0 +1,379 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage[font=small,labelfont=bf]{caption}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+\hypersetup{pdftitle={A Real-Time Crypto Market Data Pipeline with Honest Latency and Loss Monitoring},
+  pdfauthor={Kevin Feltrin},
+  pdfkeywords={market data, websocket, TimescaleDB, latency, clock synchronisation, monitoring}}
+
+\input{generated/results.tex}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\repo}{\url{https://github.com/KvnFltr/crypto-market-data-pipeline}}
+\newcommand{\ms}{\,ms}
+
+\title{\textbf{A Real-Time Crypto Market Data Pipeline}\\[4pt]
+  \large with Honest Latency and Loss Monitoring}
+\author{Kevin Feltrin}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Every quantitative strategy starts with market data, and two questions about that data are rarely answered
+with numbers: how late is it, and is any of it missing? This report describes \code{marketpipe}, a pipeline
+that ingests trades and order book updates from three crypto exchanges (Binance, Coinbase, Kraken) over
+websockets, stores them in TimescaleDB, and measures both quantities. Losses are counted exactly by checking
+the venues' sequence numbers, and every gap is repaired from the venues' REST history; storage is idempotent,
+so the result is effectively-once. Latencies are corrected for the offset of the local clock, measured against
+NTP servers, and reported with the uncertainty of that correction. In a live experiment of \TotalHours{} hours
+(\TradesRows{} trades) with a planned restart, \ChaosDisconnects{} injected disconnections and an unplanned
+\SuspensionMinutes-minute suspension of the host, the pipeline detected \TotalMissing{} missing trades and
+recovered \RecoveredPctText{} of them; an independent audit against each venue's history found \AuditMissing{}
+missing and \AuditMismatched{} altered trades out of \AuditReference. The local clock turned out to be one second
+ahead of UTC: uncorrected, every latency would have been overstated by a second. Corrected, the median latency
+from Paris is \LatBinancePfifty\ms{} for Binance (Tokyo), \LatCoinbasePfifty\ms{} for Coinbase and
+\LatKrakenPfifty\ms{} for Kraken. A control experiment with an independent receiver shows that the pipeline adds
+about a millisecond to the median and that most latency spikes originate upstream. Code, tests, dashboards and
+data are available at \repo.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+% =====================================================================================================
+\section{Introduction}
+
+A market data pipeline is judged on two properties that are easy to claim and hard to verify. The first is
+\emph{completeness}: a strategy back-tested on data with silent holes, or trading on a feed that dropped the
+last two seconds, is wrong in ways that do not show up until it loses money. The second is \emph{timeliness}:
+an estimate of latency that ignores the error of the local clock, or that averages away the tail, says little
+about the delay a strategy will actually experience \citep{tene2015}.
+
+This project builds a small pipeline that takes both seriously:
+\begin{itemize}[nosep]
+  \item it never drops data silently: every message carries a venue sequence number, so a loss is a measured
+        quantity, and every lost trade is recovered from the venue's REST history;
+  \item it measures latency against a corrected clock and reports the uncertainty of that correction, its own
+        contribution separately, and the physical lower bound set by the speed of light;
+  \item it exposes all of this as metrics, dashboards and alerts, and checks its own completeness with an
+        independent audit.
+\end{itemize}
+\Cref{sec:architecture} presents the architecture, \cref{sec:venues} the venues and their sequencing guarantees,
+\cref{sec:losses,sec:latency} the treatment of losses and latency, \cref{sec:storage,sec:monitoring,sec:testing}
+storage, monitoring and testing. \Cref{sec:results} reports a live experiment.
+
+% =====================================================================================================
+\section{Architecture}\label{sec:architecture}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[
+  node distance=6mm and 5mm, font=\small,
+  box/.style={draw, rounded corners=2pt, align=center, minimum height=9mm, fill=white},
+  ext/.style={box, fill=gray!10},
+  store/.style={box, fill=blue!6},
+  arr/.style={-{Stealth[length=2mm]}, thick},
+  side/.style={-{Stealth[length=2mm]}, dashed}]
+  \node[ext] (bn) {Binance\\ \footnotesize trades, depth};
+  \node[ext, below=of bn] (cb) {Coinbase\\ \footnotesize matches, heartbeat};
+  \node[ext, below=of cb] (kr) {Kraken\\ \footnotesize trades, heartbeat};
+  \node[box, right=12mm of cb, minimum width=30mm] (feed) {Feed handlers\\ \footnotesize parse, sequence check,\\ \footnotesize order book sync};
+  \node[box, right=of feed] (queue) {Bounded\\ queue};
+  \node[box, right=of queue] (writer) {Batch writer\\ \footnotesize COPY + dedup};
+  \node[store, right=of writer] (db) {TimescaleDB\\ \footnotesize hypertables,\\ \footnotesize 1-min bars};
+  \node[box, above=9mm of writer] (backfill) {Backfill workers\\ \footnotesize REST history};
+  \node[box, below=9mm of queue] (clock) {Clock monitor\\ \footnotesize NTP, exchange time};
+  \node[store, below=9mm of db] (prom) {Prometheus\\ \footnotesize + Grafana, alerts};
+  \draw[arr] (bn.east) -- (feed.north west);
+  \draw[arr] (cb.east) -- (feed.west);
+  \draw[arr] (kr.east) -- (feed.south west);
+  \draw[arr] (feed) -- (queue);
+  \draw[arr] (queue) -- (writer);
+  \draw[arr] (writer) -- (db);
+  \draw[side] (feed.north) |- node[pos=0.75, above, font=\footnotesize] {gaps} (backfill.west);
+  \draw[side] (backfill.east) -| (db.north);
+  \draw[side] (clock.north) -- node[pos=0.45, right=1mm, font=\footnotesize] {offset} ([xshift=6mm]feed.south east);
+  \draw[side] (writer.south) |- node[pos=0.25, right, font=\footnotesize] {metrics} (prom.west);
+\end{tikzpicture}
+\caption{Data flow. Solid arrows carry market data (websockets from the venues); dashed arrows carry gaps, clock corrections and metrics.}
+\label{fig:architecture}
+\end{figure}
+
+The pipeline (\cref{fig:architecture}) is a single Python process built on \code{asyncio}. One feed handler per
+venue owns a websocket connection: it decodes each message into normalised events (trades, depth updates,
+heartbeats), checks sequence numbers, maintains the Binance order books, and puts trades and best quotes on a
+bounded queue. A batch writer drains the queue into TimescaleDB. Gaps are handed to one backfill worker per
+venue, which fetches the missing trades over REST and stores them through the same idempotent path. A clock
+monitor samples NTP servers and the Binance server clock. All components export Prometheus metrics.
+
+\paragraph{Why one event loop.} At the rates involved (hundreds of messages per second, a few thousand during
+bursts) the work per message is a few tens of microseconds, so one core is ample and a single event loop avoids
+any synchronisation. The design choice that matters is \emph{where} delay can accumulate: reads, writes and REST
+calls are all non-blocking, and the only shared resource, the queue, is bounded. When the database falls behind,
+\code{queue.put} blocks the readers; the exchange eventually disconnects the slow consumer, and the resulting gap
+is repaired like any other. Nothing is ever dropped to keep up. On Linux the loop runs on \code{uvloop}.
+
+% =====================================================================================================
+\section{Venues and sequencing guarantees}\label{sec:venues}
+
+Exact loss accounting relies on what each venue guarantees about its message numbering
+(\cref{tab:venues}). All three number their trades with an integer that increases by exactly one per trade and
+per instrument, and all three publish their trade history over REST, which makes every lost trade recoverable.
+
+\begin{table}[ht]
+\centering
+\caption{Feeds used, with their sequencing and recovery semantics.}
+\label{tab:venues}
+\small
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{1.5cm}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}p{3.3cm}>{\raggedright\arraybackslash}p{3.2cm}>{\raggedright\arraybackslash}p{3.0cm}@{}}
+\toprule
+Venue & Stream & Sequence & Timestamps & Recovery \\
+\midrule
+Binance & \code{@trade} & trade id \code{t}, $+1$ per trade & trade time $T$ and event time $E$, $\mu$s & \code{historicalTrades} by id \\
+        & \code{@depth@100ms} & update ids $[U,u]$, chained & event time, $\mu$s & none: resync from snapshot \\
+Coinbase & \code{matches} & \code{trade\_id}, $+1$ per trade & trade time, $\mu$s & \code{/trades} by id, backwards \\
+         & \code{heartbeat} & last trade id, every second & -- & reveals silent losses \\
+Kraken & \code{trade} (API v2) & \code{trade\_id}, $+1$ per trade & trade time, $\mu$s & \code{/Trades} by time \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Several details matter for correctness. The aggressor side is reported differently: Binance gives a
+``buyer is maker'' flag, Coinbase the side of the \emph{maker} order, Kraken the side of the taker; the adapters
+normalise all three to the aggressor side. Binance closes connections after 24 hours, so the pipeline rotates
+them after 23. Kraken's REST history is indexed by time rather than by trade id, so recovery starts searching at
+the exchange time of the last trade received before the gap.
+
+% =====================================================================================================
+\section{Detecting and recovering lost messages}\label{sec:losses}
+
+\subsection{Gap detection}
+
+A websocket runs over TCP, so within one connection the network cannot reorder or drop messages. Losses still
+happen: venues drop messages for slow consumers, and every message published while we are disconnected is
+lost. For each instrument the feed handler compares the trade id $s_n$ with the last one seen, $s_{n-1}$:
+\[
+  s_n = s_{n-1} + 1 \;\Rightarrow\; \text{in order}, \quad
+  s_n \le s_{n-1} \;\Rightarrow\; \text{duplicate}, \quad
+  s_n > s_{n-1} + 1 \;\Rightarrow\; \text{gap } [s_{n-1}+1,\, s_n-1].
+\]
+Each gap is classified by cause: \emph{in session} (no reconnection in between), \emph{reconnect} (first trade
+after a reconnection), \emph{restart} (first trade after the process started, compared with the last trade
+stored in the database), or \emph{heartbeat}. The last case covers a quiet market: Coinbase announces in its
+heartbeat the id of the last trade, and an announced id that never arrives reveals a loss that no subsequent
+trade would expose. Because a heartbeat may overtake the trades it announces, it is only acted upon after a
+two-second grace period.
+
+A connection can also fail silently: a half-open TCP connection stays ``up'' while nothing arrives. Every feed
+therefore has a staleness deadline (15 to 30 seconds without any message, heartbeats included) after which it
+reconnects. Reconnections use exponential backoff with full jitter, so that many clients do not retry in
+lockstep \citep{brooker2015}.
+
+\subsection{Recovery and effectively-once storage}
+
+Every gap is stored in a \code{gaps} table, then repaired by a backfill worker that downloads the missing trades
+from the venue's REST history and stores them with \code{source = 'rest'}. The outcome is recorded:
+\emph{recovered}, \emph{partial} or \emph{unrecoverable}. Delivery from the venues is therefore at least once
+(a trade may arrive twice: live, and again from the history), and the storage layer makes it effectively once
+by deduplicating on the trade id (\cref{sec:storage}). The same mechanism covers process restarts: at start-up
+each feed is seeded with the last trade id stored, so that the trades published while the pipeline was down
+form an ordinary gap.
+
+\subsection{Order books}
+
+Binance depth updates cover ranges of book update ids $[U,u]$ that must chain: $U_{n} = u_{n-1}+1$. They are
+applied to a local book built from a REST snapshot, following the venue's procedure \citep{binance-ws}: buffer
+the stream, fetch a snapshot with id $L$, drop updates with $u \le L$, require the first remaining update to
+satisfy $U \le L+1 \le u$, then apply updates in order. A broken chain cannot be repaired by replaying
+updates, so it triggers a rebuild from a new snapshot and is recorded as a \emph{resynced} gap. In practice the
+snapshot is often \emph{ahead} of the stream; the synchroniser then keeps it and waits for the stream to catch
+up instead of fetching a new one, which brought the time to a live book from about 15 seconds to under one.
+The best bid and offer are stored whenever they change.
+
+% =====================================================================================================
+\section{Measuring latency honestly}\label{sec:latency}
+
+\subsection{Definitions}
+
+For a trade stamped $t_{\mathrm{ex}}$ by the venue and received at local wall-clock time $t_{\mathrm{rx}}$, the
+\emph{exchange latency} is $L = t_{\mathrm{rx}} - t_{\mathrm{ex}}$. It compares two clocks. If the local clock
+differs from true time by $\varepsilon$, the measured value is off by exactly $\varepsilon$, which can reach a
+second on a desktop machine, as it did in our experiment. The pipeline therefore estimates the offset $\theta = -\varepsilon$ of the
+local clock against reference clocks and reports $L = t_{\mathrm{rx}} + \theta - t_{\mathrm{ex}}$, assuming
+that the venues' clocks are synchronised to UTC.
+
+\subsection{Clock offset and its uncertainty}
+
+The offset is measured with SNTP \citep{rfc4330,mills1991}. A request leaves at local time $t_0$, the server
+stamps its reception $t_1$ and its reply $t_2$, and the reply arrives at $t_3$. Then
+\[
+  \hat\theta = \frac{(t_1 - t_0) + (t_2 - t_3)}{2}, \qquad \delta = (t_3 - t_0) - (t_2 - t_1),
+\]
+and, whatever the split of the round-trip delay $\delta$ between the two directions, the true offset lies within
+$\hat\theta \pm \delta/2$. Like NTP's clock filter, the pipeline keeps the last samples and uses the one with
+the smallest delay. As a cross-check it applies Cristian's algorithm \citep{cristian1989} to Binance's server
+time, $\hat\theta = T_{\mathrm{server}} - (t_0+t_3)/2$, with uncertainty $\pm (t_3 - t_0)/2$. Raw receipt times
+are stored unchanged; the correction is applied at analysis time from the recorded clock samples.
+
+\subsection{What else is in the number}
+
+Three other effects are bounded explicitly.
+\begin{enumerate}[nosep]
+  \item \emph{Venue-side delay.} Binance publishes both the trade time $T$ and the event time $E$ at which the
+        message was emitted, which splits $L$ into an internal part $E - T$ and a transport part
+        $t_{\mathrm{rx}} - E$, each measured on a single clock domain except for the offset.
+  \item \emph{Our own delay.} $t_{\mathrm{rx}}$ is taken when the event loop hands the message to the feed
+        handler, so a busy loop inflates it. The pipeline measures the scheduling lag of its event loop
+        continuously, and its internal latencies (receipt to database commit) on the monotonic clock.
+  \item \emph{Physics.} Light in fibre travels at about $2\times10^5$ km/s. Paris is 9\,712 km from Tokyo, where
+        Binance's spot matching engine is publicly reported to run (AWS \code{ap-northeast-1}), and 6\,186 km
+        from northern Virginia (AWS \code{us-east-1}, reported for Coinbase), so one-way latencies below 48.6\ms{}
+        and 30.9\ms{} respectively are impossible; real routes are longer.
+\end{enumerate}
+Finally, a \emph{control experiment} separates the pipeline from the outside world: a minimal process that does
+nothing but receive the Binance trade stream records the same latency in parallel (\cref{sec:res-latency}).
+
+% =====================================================================================================
+\section{Storage}\label{sec:storage}
+
+Trades and quotes are stored in TimescaleDB hypertables partitioned by exchange time in one-day chunks
+\citep{timescale}. Writes are batched: a batch is flushed after 2\,000 rows or 100\ms, whichever comes first,
+which bounds the delay added by batching. A batch is copied with \code{COPY} into a temporary table and inserted
+into the hypertable with a single statement that skips trades already stored:
+\begin{verbatim}
+INSERT INTO trades
+SELECT DISTINCT ON (venue, symbol, trade_id) ... FROM trades_stage s
+WHERE NOT EXISTS (
+    SELECT 1 FROM trades t
+    WHERE (t.venue, t.symbol, t.trade_id) = (s.venue, s.symbol, s.trade_id)
+      AND t.exchange_ts BETWEEN s.exchange_ts - '1 min'
+                            AND s.exchange_ts + '1 min')
+ON CONFLICT DO NOTHING
+\end{verbatim}
+Two details are worth noting. A unique constraint on a hypertable must include the partitioning column, so the
+primary key is (venue, symbol, trade\_id, exchange\_ts); but the live and REST copies of a trade can carry
+timestamps rounded differently by a microsecond, so deduplication matches trade ids within a one-minute window,
+which keeps the lookup on recent chunks. Within a batch, the live copy is preferred because it carries the
+receipt time. A continuous aggregate maintains one-minute OHLCV bars, and chunks older than a day are compressed
+into columnar form.
+
+% =====================================================================================================
+\section{Monitoring}\label{sec:monitoring}
+
+The pipeline exports Prometheus metrics: messages and bytes per venue; latency histograms (exchange to receipt,
+receipt to commit, parse time, event-loop lag, websocket ping round trip); gaps, missing, recovered and
+unrecovered trades by venue and cause; reconnections by reason; order book resyncs; queue depth; batch sizes,
+write times and errors; clock offset and delay. A provisioned Grafana dashboard combines them with queries on
+TimescaleDB (prices, trades per minute, latest gaps, disconnections as annotations), and alert rules cover the
+failure modes that matter (\cref{tab:alerts}). The rules follow the usual site-reliability practice of alerting
+on symptoms that need a human \citep{beyer2016}: an unrecoverable loss pages; a recovered gap does not.
+
+\begin{table}[ht]
+\centering
+\caption{Prometheus alert rules.}
+\label{tab:alerts}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Alert & Condition & Severity \\
+\midrule
+FeedStale & no message for 30 s, sustained 1 min & critical \\
+FeedDisconnected & websocket down for 2 min & critical \\
+TradesLost & any unrecoverable trade in 15 min & critical \\
+DatabaseWriteErrors & any failed batch write in 5 min & critical \\
+GapRateHigh & more than 5 trade gaps in 10 min & warning \\
+ExchangeLatencyHigh & p99 above 1 s for 5 min & warning \\
+WriterBacklog & more than 50\,000 queued events for 1 min & warning \\
+ClockOffsetLarge & local clock more than 50\ms{} from NTP for 10 min & warning \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================================================
+\section{Testing}\label{sec:testing}
+
+The test suite (\TestCount{} tests, run in continuous integration on Python 3.11 to 3.13 against a TimescaleDB
+service container) has three layers.
+\begin{itemize}[nosep]
+  \item \emph{Unit tests}: sequence tracking, SNTP encoding and offset arithmetic (including a local NTP server
+        whose clock is 50\ms{} ahead), the parsers on messages captured from the live feeds, REST pagination of
+        each venue, the order book procedure (snapshot ahead of the stream, broken chain, resync), backoff.
+  \item \emph{A fake exchange}: a local websocket server that produces a trade tape whether or not anyone is
+        listening, and can silently drop messages, cut connections and refuse reconnections. Feed tests check
+        that every trade of the tape is either received or covered by a detected gap.
+  \item \emph{End-to-end tests} on a real database: the full pipeline runs against the fake exchange with
+        dropped messages, cut connections, random forced disconnections and a restart, and the database must
+        hold every trade of the tape exactly once. The completeness audit must find a trade deleted by hand
+        and a price altered by hand.
+\end{itemize}
+Linting (\code{ruff}) and static typing (\code{mypy --strict}) are enforced in CI, and the Docker image is built
+and smoke-tested.
+
+% =====================================================================================================
+\section{Experiment and results}\label{sec:results}
+
+\input{results}
+
+% =====================================================================================================
+\section{Limitations}\label{sec:limitations}
+
+\begin{itemize}[nosep]
+  \item \emph{Clock assumptions.} The correction assumes the venues' clocks are synchronised to UTC; it removes
+        our clock error, not theirs. One-way latencies remain uncertain by the NTP error bound.
+  \item \emph{Measurement point.} Receipt is timestamped in user space after the TLS and websocket layers.
+        Kernel or NIC timestamps would remove the event-loop component, and on Windows the event loop's timer
+        resolution (15.6\ms) inflates the measured loop lag.
+  \item \emph{Network.} The experiment ran over a university Wi-Fi network, whose latency and loss are not
+        those of a co-located or even a wired connection; the absolute latencies are specific to that setup.
+  \item \emph{Metrics during outages.} Prometheus counters restart with the process and miss what happens while
+        the host is down, so dashboards undercount losses around restarts; the \code{gaps} table is the record.
+  \item \emph{Single process, single host.} The pipeline is not highly available: a host failure is recovered
+        from the REST history at restart, within the venues' history and rate limits. A production system would
+        run redundant ingestors in different regions, behind a log such as Kafka \citep{kreps2011,kleppmann2017}.
+  \item \emph{Order books.} Order book losses are detected and resynchronised but cannot be backfilled, and the
+        local book is only checked for internal consistency (it must never be crossed).
+\end{itemize}
+
+\section{Conclusion}
+
+The pipeline turns two usually implicit properties of market data, completeness and timeliness, into measured
+quantities. Sequence numbers make losses exact; the venues' histories and idempotent storage make them
+recoverable; an independent audit confirms the result. Latencies are corrected for the local clock, bounded by
+physics, and separated from the pipeline's own delay by a control experiment. The same principles carry over to
+professional feeds, where sequence numbers, gap-fill services and hardware timestamps play the roles of the
+public APIs used here.
+
+\appendix
+\section{Reproducing the results}
+
+\begin{verbatim}
+docker compose up -d                     # TimescaleDB, Prometheus, Grafana
+pip install -e ".[dev,analysis]"
+marketpipe run --label baseline --duration 6000   # then a 5-minute stop
+marketpipe run --label chaos --chaos --chaos-interval 120 --duration 2700
+python tools/latency_probe.py            # in parallel: the control experiment
+python analysis/export.py --audit --compress      # -> results/*.csv
+python analysis/make_figures.py          # figures, tables, macros
+\end{verbatim}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
