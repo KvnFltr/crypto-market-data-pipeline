@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check src tests tools
+      - run: ruff format --check src tests tools
+      - run: mypy
+
+  test:
+    name: tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    services:
+      timescaledb:
+        image: timescale/timescaledb:2.31.2-pg17
+        env:
+          POSTGRES_USER: marketpipe
+          POSTGRES_PASSWORD: marketpipe
+          POSTGRES_DB: marketpipe_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U marketpipe" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      MARKETPIPE_TEST_DSN: postgresql://marketpipe:marketpipe@localhost:5432/marketpipe_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - name: Unit and integration tests
+        run: pytest -v
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t marketpipe .
+      - run: docker run --rm marketpipe schema | head -5
+      - run: docker compose config --quiet
+
+  report:
+    name: LaTeX report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: xu-cheng/latex-action@v3
+        with:
+          root_file: report.tex
+          working_directory: report
+      - uses: actions/upload-artifact@v7
+        with:
+          name: report
+          path: report/report.pdf
