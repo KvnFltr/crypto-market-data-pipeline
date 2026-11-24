@@ -1,0 +1,56 @@
+groups:
+  - name: marketpipe
+    rules:
+      - alert: FeedStale
+        expr: marketpipe_last_message_age_seconds > 30
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "No message from {{ $labels.venue }} for more than 30 s"
+
+      - alert: FeedDisconnected
+        expr: marketpipe_connected == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.venue }} websocket down for 2 minutes"
+
+      - alert: TradesLost
+        expr: increase(marketpipe_unrecovered_total[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "{{ $labels.venue }}: trades missing and not recoverable from the REST history"
+
+      - alert: GapRateHigh
+        expr: sum by (venue) (increase(marketpipe_gaps_total{stream="trades"}[10m])) > 5
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.venue }}: more than 5 sequence gaps in 10 minutes"
+
+      - alert: ExchangeLatencyHigh
+        expr: >
+          histogram_quantile(0.99, sum by (venue, le) (rate(marketpipe_exchange_latency_seconds_bucket[5m]))) > 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "{{ $labels.venue }}: p99 exchange-to-receipt latency above 1 s"
+
+      - alert: WriterBacklog
+        expr: marketpipe_queue_depth > 50000
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "Writer queue above 50k events: the database is not keeping up"
+
+      - alert: DatabaseWriteErrors
+        expr: increase(marketpipe_db_errors_total[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "Batch writes to TimescaleDB are failing"
+
+      - alert: ClockOffsetLarge
+        expr: abs(marketpipe_clock_offset_seconds{reference="model"}) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Local clock more than 50 ms away from NTP: exchange latencies are biased"
